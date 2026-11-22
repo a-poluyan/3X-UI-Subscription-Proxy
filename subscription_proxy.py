@@ -1,4 +1,4 @@
-"""Route the KVN RU profile through VLESS in a live 3x-ui subscription."""
+"""Route a selected 3x-ui JSON subscription profile entirely through VLESS."""
 
 import argparse
 import http.client
@@ -8,9 +8,6 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-RU_HOST = "kvn.lextech1.ru"
-RU_PORT = 443
-RU_PREFIX = "🇷🇺 RU |"
 MAX_BODY = 8 * 1024 * 1024
 TIMEOUT = 12
 MAX_CONNECTIONS = 32
@@ -22,30 +19,38 @@ HOP_HEADERS = {
 BODY_VALIDATORS = {"etag", "content-md5", "content-digest", "digest", "accept-ranges"}
 
 
-def ru_profile(profile):
-    return isinstance(profile, dict) and str(profile.get("remarks", "")).startswith(RU_PREFIX) and any(
+def matches_profile(profile, hostname, profile_prefix):
+    return isinstance(profile, dict) and str(profile.get("remarks", "")).startswith(profile_prefix) and any(
         outbound.get("tag") == "proxy"
         and outbound.get("protocol") == "vless"
-        and outbound.get("settings", {}).get("address") == RU_HOST
-        and outbound.get("settings", {}).get("port") == RU_PORT
+        and outbound.get("settings", {}).get("address") == hostname
+        and outbound.get("settings", {}).get("port") == 443
         for outbound in profile.get("outbounds", [])
     )
 
 
-def rewrite_ru_profile(body):
+def rewrite_profile(body, hostname, profile_prefix):
     try:
         data = json.loads(body)
         entries = data if isinstance(data, list) else [data]
-        profile = next((item for item in entries if ru_profile(item)), None)
+        profile = next((item for item in entries if matches_profile(item, hostname, profile_prefix)), None)
         if profile is None:
             return body
         profile.setdefault("routing", {})["rules"] = [
             {"type": "field", "network": "tcp,udp", "outboundTag": "proxy"}
         ]
-        for resolver in profile.get("dns", {}).get("servers", []):
-            if isinstance(resolver, dict) and resolver.get("address") == "https+local://8.8.8.8/dns-query":
-                resolver["domains"] = [f"full:{RU_HOST}"]
-                resolver["skipFallback"] = True
+        servers = profile.get("dns", {}).get("servers", [])
+        for index, resolver in enumerate(servers):
+            address = resolver.get("address") if isinstance(resolver, dict) else resolver
+            if not isinstance(address, str):
+                continue
+            scheme, separator, _ = address.lower().partition("://")
+            if address.lower() != "localhost" and not (separator and scheme.endswith("+local")):
+                continue
+            if isinstance(resolver, str):
+                resolver = servers[index] = {"address": address}
+            resolver["domains"] = [f"full:{hostname}"]
+            resolver["skipFallback"] = True
         return json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     except (ValueError, TypeError, AttributeError):
         # A response outside the expected 3x-ui schema is served verbatim.
@@ -87,7 +92,7 @@ class SubscriptionHandler(BaseHTTPRequestHandler):
             if self.server.origin_tls:
                 connection.connect()
                 connection.sock = self.server.origin_tls.wrap_socket(
-                    connection.sock, server_hostname=self.server.origin_hostname
+                    connection.sock, server_hostname=self.server.hostname
                 )
             connection.request(self.command, self.path, headers=headers)
             with connection.getresponse() as upstream:
@@ -115,7 +120,7 @@ class SubscriptionHandler(BaseHTTPRequestHandler):
 
         updated = body
         if self.command == "GET" and status == 200 and is_json and self.path.startswith(("/subscription/", "/json_sub/")):
-            updated = rewrite_ru_profile(body)
+            updated = rewrite_profile(body, self.server.hostname, self.server.profile_prefix)
 
         self.send_response_only(status)
         for key, value in response_headers:
@@ -135,11 +140,12 @@ class SubscriptionHandler(BaseHTTPRequestHandler):
 
 
 class SubscriptionServer(ThreadingHTTPServer):
-    def __init__(self, address, origin_port, origin_hostname, public_tls=None):
+    def __init__(self, address, origin_port, hostname, profile_prefix, *, origin_tls=None, public_tls=None):
         super().__init__(address, SubscriptionHandler)
         self.origin_port = origin_port
-        self.origin_hostname = origin_hostname
-        self.origin_tls = ssl.create_default_context() if origin_hostname else None
+        self.hostname = hostname
+        self.profile_prefix = profile_prefix
+        self.origin_tls = origin_tls
         self.public_tls = public_tls
         self.connections = threading.BoundedSemaphore(MAX_CONNECTIONS)
 
@@ -174,6 +180,8 @@ def main():
     parser.add_argument("--listen", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=12096)
     parser.add_argument("--origin-port", type=int, default=2096)
+    parser.add_argument("--hostname", required=True, help="DNS name on the 3x-ui certificate and VLESS profile")
+    parser.add_argument("--profile-prefix", required=True, help="Start of the selected profile name")
     parser.add_argument("--cert")
     parser.add_argument("--key")
     args = parser.parse_args()
@@ -183,12 +191,15 @@ def main():
         parser.error("a public listener requires --cert and --key")
     if args.port == args.origin_port:
         parser.error("the public and origin ports must differ")
+    if not args.hostname.strip() or not args.profile_prefix.strip():
+        parser.error("--hostname and --profile-prefix must be non-empty")
     public_tls = None
     if args.cert:
         public_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         public_tls.load_cert_chain(args.cert, args.key)
     with SubscriptionServer(
-        (args.listen, args.port), args.origin_port, RU_HOST, public_tls
+        (args.listen, args.port), args.origin_port, args.hostname, args.profile_prefix,
+        origin_tls=ssl.create_default_context(), public_tls=public_tls,
     ) as server:
         server.serve_forever()
 
