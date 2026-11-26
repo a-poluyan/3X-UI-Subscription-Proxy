@@ -10,12 +10,14 @@ import ssl
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs
+
+from geodata_sets import GEODATA_FIELDS, SET_ID, compatible_set, selection_revision
 
 
 MAX_BODY = 8 * 1024 * 1024
 TIMEOUT = 12
 MAX_CONNECTIONS = 32
-GEODATA_FIELDS = {"geosite.dat": "Geositeurl", "geoip.dat": "Geoipurl"}
 
 HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -33,7 +35,7 @@ def geodata_version(directory):
     return 0
 
 
-def refresh_routing(value, directory, geodata_url):
+def refresh_routing(value, directory, geodata_url, *, body=None, subscription_path=None):
     prefix = "happ://routing/"
     if not value.startswith(prefix):
         return value
@@ -55,12 +57,28 @@ def refresh_routing(value, directory, geodata_url):
         previous_time = int(previous)
     except (TypeError, ValueError):
         previous_time = 0
-    version = geodata_version(directory)
-    if previous_time >= 10 ** 12:
-        version *= 1000
-    if version <= previous_time:
+    publication = geodata_version(directory)
+    multiplier = 1000 if previous_time >= 10 ** 12 else 1
+    version = publication
+    identifier = None
+    if publication > 0 and body is not None:
+        sets = directory / "sets"
+        if sets.is_dir():
+            identifier = compatible_set(sets, directory / str(publication), profile, body)
+            selection = identifier or f"full:{publication}"
+            baseline = previous_time // multiplier if identifier else max(publication, previous_time // multiplier)
+            try:
+                version = selection_revision(sets, subscription_path, selection, baseline)
+            except (OSError, ValueError):
+                identifier = None
+    if identifier:
+        for name, field in GEODATA_FIELDS.items():
+            profile[field] = f"{geodata_url}{name}?set={identifier}"
+
+    timestamp = max(previous_time, version * multiplier)
+    if not identifier and timestamp <= previous_time:
         return value
-    profile["LastUpdated"] = version if type(previous) is int else str(version)
+    profile["LastUpdated"] = timestamp if type(previous) is int else str(timestamp)
     encoded = base64.b64encode(json.dumps(profile, ensure_ascii=False, separators=(",", ":")).encode()).decode()
     return f"{prefix}{action}/{encoded}"
 
@@ -120,14 +138,18 @@ class SubscriptionHandler(BaseHTTPRequestHandler):
         # Request URLs contain personal subscription IDs.
         pass
 
-    def send_geodata(self, name):
+    def send_geodata(self, name, query):
         directory = self.server.geodata_dir
-        version = geodata_version(directory)
-        if name not in GEODATA_FIELDS or version <= 0:
+        values = parse_qs(query, keep_blank_values=True).get("set")
+        if name not in GEODATA_FIELDS or (values and (len(values) != 1 or not SET_ID.fullmatch(values[0]))):
             self.send_error(404)
             return
+        if values:
+            folder = directory / "sets" / values[0]
+        else:
+            folder = directory / str(geodata_version(directory))
         try:
-            source = (directory / str(version) / name).open("rb")
+            source = (folder / name).open("rb")
         except FileNotFoundError:
             self.send_error(404)
             return
@@ -135,7 +157,7 @@ class SubscriptionHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(os.fstat(source.fileno()).st_size))
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable" if values else "no-store")
             self.end_headers()
             if self.command == "GET":
                 shutil.copyfileobj(source, self.wfile)
@@ -145,9 +167,9 @@ class SubscriptionHandler(BaseHTTPRequestHandler):
             self.send_error(400)
             return
 
-        path = self.path.partition("?")[0]
+        path, _, query = self.path.partition("?")
         if self.server.geodata_dir is not None and path.startswith("/geo/"):
-            self.send_geodata(path.removeprefix("/geo/"))
+            self.send_geodata(path.removeprefix("/geo/"), query)
             return
 
         headers = {
@@ -190,8 +212,13 @@ class SubscriptionHandler(BaseHTTPRequestHandler):
             return
 
         updated = body
-        if self.command == "GET" and status == 200 and is_json and self.path.startswith(("/subscription/", "/json_sub/")):
+        json_subscription = (
+            self.command == "GET" and status == 200 and is_json
+            and path.startswith(("/subscription/", "/json_sub/"))
+        )
+        if json_subscription:
             updated = rewrite_profile(body, self.server.hostname, self.server.profile_prefix)
+        happ_json = json_subscription and "happ" in self.headers.get("User-Agent", "").lower()
 
         self.send_response_only(status)
         for key, value in response_headers:
@@ -200,7 +227,10 @@ class SubscriptionHandler(BaseHTTPRequestHandler):
             if updated != body and key.lower() in BODY_VALIDATORS:
                 continue
             if status == 200 and key.lower() == "routing" and self.server.geodata_dir is not None:
-                value = refresh_routing(value, self.server.geodata_dir, self.server.geodata_url)
+                value = refresh_routing(
+                    value, self.server.geodata_dir, self.server.geodata_url,
+                    body=updated if happ_json else None, subscription_path=path,
+                )
             self.send_header(key, value)
         if not no_body:
             self.send_header("Content-Length", str(len(updated)))

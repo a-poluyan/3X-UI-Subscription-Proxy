@@ -6,6 +6,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib.parse import urlsplit
 
 from subscription_proxy import SubscriptionServer, rewrite_profile
 
@@ -38,6 +39,11 @@ class Origin(BaseHTTPRequestHandler):
         else:
             kind = "text/plain" if self.path.startswith("/json_sub/") else "application/json"
             body = json.dumps([PROFILE, OTHER]).encode()
+        extra = self.headers.get("X-Test-Geo-Rule")
+        if extra and kind in ("application/json", "text/plain"):
+            configs = json.loads(body)
+            configs[-1]["dns"] = {"hosts": {extra: "127.0.0.1"}}
+            body = json.dumps(configs).encode()
         self.send_response(200)
         self.send_header("Content-Type", kind)
         self.send_header("Content-Length", str(len(body)))
@@ -155,6 +161,64 @@ class SubscriptionProxyTest(unittest.TestCase):
             self.assertEqual(request_routing(routing), {**routing, "LastUpdated": 1700000000})
             external = {**routing, "Geoipurl": "https://other.example.com/geoip.dat"}
             self.assertEqual(request_routing(external), external)
+
+            sets = path / "sets"
+            sets.mkdir()
+
+            def entry(tag):
+                code = tag.encode()
+                body = bytes([10, len(code)]) + code
+                return bytes([10, len(body)]) + body
+
+            (version / "geosite.dat").write_bytes(entry("CANVA") + entry("YOUTUBE"))
+            (version / "geoip.dat").write_bytes(entry("TELEGRAM") + entry("RU"))
+
+            def compact(profile, *, extra=None, agent="Happ/5.0"):
+                payload = base64.b64encode(json.dumps(profile).encode()).decode()
+                request_headers = {
+                    "User-Agent": agent, "X-Hwid": "test-device",
+                    "X-Test-Routing": "happ://routing/onadd/" + payload,
+                }
+                if extra:
+                    request_headers["X-Test-Geo-Rule"] = extra
+                _, headers, _ = request("/json_sub/client", headers=request_headers)
+                return json.loads(base64.b64decode(headers["Routing"].split("/", 4)[4]))
+
+            selected = {**routing, "ProxySites": ["geosite:canva"], "ProxyIp": ["geoip:telegram"]}
+            first = compact(selected, extra="geosite:canva")
+            site_path = urlsplit(first["Geositeurl"]).path + "?" + urlsplit(first["Geositeurl"]).query
+            ip_path = urlsplit(first["Geoipurl"]).path + "?" + urlsplit(first["Geoipurl"]).query
+            self.assertIn("?set=", site_path)
+            self.assertEqual(site_path.split("?")[1], ip_path.split("?")[1])
+            self.assertEqual(request(site_path)[2], entry("CANVA"))
+            self.assertEqual(request(ip_path)[2], entry("TELEGRAM"))
+            self.assertIn("immutable", request(site_path, "HEAD")[1]["Cache-Control"])
+            self.assertEqual(request("/geo/geosite.dat")[2], entry("CANVA") + entry("YOUTUBE"))
+            self.assertEqual(request("/geo/geosite.dat?set=../current")[0], 404)
+            self.assertEqual(compact(selected, extra="geosite:canva"), first)
+            self.assertEqual(compact(selected, agent="INCY")["Geositeurl"], routing["Geositeurl"])
+
+            fallback = compact(selected, extra="geosite:youtube")
+            self.assertEqual(fallback["Geositeurl"], routing["Geositeurl"])
+            self.assertGreater(fallback["LastUpdated"], first["LastUpdated"])
+            restored = compact(selected)
+            self.assertEqual(restored["Geositeurl"], first["Geositeurl"])
+            self.assertGreater(restored["LastUpdated"], fallback["LastUpdated"])
+
+            next_version = path / "1700000010"
+            next_version.mkdir()
+            (next_version / "geosite.dat").write_bytes(entry("CANVA") + entry("GITHUB"))
+            (next_version / "geoip.dat").write_bytes(entry("TELEGRAM") + entry("US"))
+            (path / "current").write_text(next_version.name, encoding="ascii")
+            self.assertEqual(compact(selected), restored)
+
+            restarted = self.start(SubscriptionServer(
+                ("127.0.0.1", 0), origin.server_port, HOSTNAME, PREFIX, geodata_dir=path,
+            ))
+            proxy = restarted
+            self.assertEqual(request(site_path)[2], entry("CANVA"))
+            self.assertEqual(request(ip_path)[2], entry("TELEGRAM"))
+
 
 
     def test_local_resolvers_are_matched_by_mode(self):
