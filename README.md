@@ -15,3 +15,37 @@ python subscription_proxy.py --listen 0.0.0.0 --port 2096 --origin-port 2097 --h
 ```sh
 python -B -m unittest -v
 ```
+
+## Раздача геобаз
+
+Передайте прокси `--geodata-dir /var/lib/3x-ui-subscription-geodata`. Файлы будут
+доступны по путям `/geo/geosite.dat` и `/geo/geoip.dat`. Укажите оба публичных HTTPS-адреса
+в полях `Geositeurl` и `Geoipurl` профиля Happ. Для такого профиля прокси передаёт
+в `LastUpdated` метку последней опубликованной пары.
+
+Скрипт берёт оба файла из `/app/bin/` указанного контейнера. Он проверяет
+контрольные суммы и публикует новую пару, если содержимое изменилось.
+Первую публикацию можно запустить сразу.
+
+```sh
+sudo python3 -B publish_geodata.py CONTAINER /var/lib/3x-ui-subscription-geodata
+```
+
+Для запуска по расписанию установите оба файла из `deploy/` в
+`/etc/systemd/system/`. Укажите в `/etc/default/3x-ui-geodata-publish`
+абсолютный путь к скрипту, имя контейнера и каталог раздачи.
+
+```ini
+GEODATA_PUBLISH_SCRIPT=/opt/3x-ui-subscription-proxy/publish_geodata.py
+GEODATA_CONTAINER=3x-ui
+GEODATA_DIRECTORY=/var/lib/3x-ui-subscription-geodata
+```
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl start 3x-ui-geodata-publish.service
+sudo systemctl enable --now 3x-ui-geodata-publish.timer
+```
+
+Таймер публикует копии по субботам в 05:00 МСК. Скачивание исходных баз
+настраивается отдельно в Xray.

@@ -1,8 +1,11 @@
+import base64
 import http.client
 import json
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from subscription_proxy import SubscriptionServer, rewrite_profile
 
@@ -41,6 +44,9 @@ class Origin(BaseHTTPRequestHandler):
         self.send_header("Subscription-Userinfo", "upload=12; download=34; total=56")
         self.send_header("Profile-Update-Interval", "1")
         self.send_header("X-Received-Path", self.path)
+        routing = self.headers.get("X-Test-Routing")
+        if routing:
+            self.send_header("Routing", routing)
         self.end_headers()
         if self.command == "GET":
             self.wfile.write(body)
@@ -99,6 +105,57 @@ class SubscriptionProxyTest(unittest.TestCase):
         self.assertEqual(rewrite_profile(original, "other.example.com", PREFIX), original)
         self.assertEqual(rewrite_profile(original, HOSTNAME, "Other |"), original)
         self.assertEqual(json.loads(rewrite_profile(original, HOSTNAME, PREFIX)), full)
+
+    def test_geo_files_and_happ_update_header(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            version = path / "1700000000"
+            version.mkdir()
+            for name in ("geosite.dat", "geoip.dat"):
+                (version / name).write_bytes(name.encode())
+            (path / "current").write_text(version.name, encoding="ascii")
+            origin = self.start(ThreadingHTTPServer(("127.0.0.1", 0), Origin))
+            proxy = self.start(SubscriptionServer(
+                ("127.0.0.1", 0), origin.server_port, HOSTNAME, PREFIX, geodata_dir=path,
+            ))
+
+            def request(path, method="GET", headers=None):
+                connection = http.client.HTTPConnection("127.0.0.1", proxy.server_port, timeout=3)
+                try:
+                    connection.request(method, path, headers=headers or {})
+                    response = connection.getresponse()
+                    return response.status, response.headers, response.read()
+                finally:
+                    connection.close()
+
+            for name in ("geosite.dat", "geoip.dat"):
+                status, headers, data = request("/geo/" + name)
+                self.assertEqual((status, data), (200, name.encode()))
+                self.assertEqual(headers["Content-Type"], "application/octet-stream")
+                self.assertEqual(headers["Cache-Control"], "no-store")
+                status, headers, data = request("/geo/" + name + "?download=1", "HEAD")
+                self.assertEqual((status, headers["Content-Length"], data), (200, str(len(name)), b""))
+            self.assertEqual(request("/geo/../current")[0], 404)
+
+            routing = {
+                "Name": "Test 🌿",
+                "Geositeurl": proxy.geodata_url + "geosite.dat",
+                "Geoipurl": proxy.geodata_url + "geoip.dat",
+                "LastUpdated": 1690000000,
+            }
+
+            def request_routing(profile):
+                payload = base64.b64encode(json.dumps(profile, ensure_ascii=False).encode()).decode()
+                uri = "happ://routing/onadd/" + payload
+                _, headers, _ = request("/subscription/test", headers={
+                    "X-Hwid": "test-device", "X-Test-Routing": uri,
+                })
+                return json.loads(base64.b64decode(headers["Routing"].removeprefix("happ://routing/onadd/")))
+
+            self.assertEqual(request_routing(routing), {**routing, "LastUpdated": 1700000000})
+            external = {**routing, "Geoipurl": "https://other.example.com/geoip.dat"}
+            self.assertEqual(request_routing(external), external)
+
 
     def test_local_resolvers_are_matched_by_mode(self):
         profile = json.loads(json.dumps(PROFILE))

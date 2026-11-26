@@ -1,0 +1,9 @@
+[Unit]
+Description=Publish 3x-ui geo databases for subscription clients
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/default/3x-ui-geodata-publish
+ExecStart=/usr/bin/python3 -B ${GEODATA_PUBLISH_SCRIPT} ${GEODATA_CONTAINER} ${GEODATA_DIRECTORY}

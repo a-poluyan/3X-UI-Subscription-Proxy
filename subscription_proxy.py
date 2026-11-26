@@ -1,22 +1,68 @@
 """Route a selected 3x-ui JSON subscription profile entirely through VLESS."""
 
 import argparse
+import base64
 import http.client
 import json
+import os
+import shutil
 import ssl
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 
 MAX_BODY = 8 * 1024 * 1024
 TIMEOUT = 12
 MAX_CONNECTIONS = 32
+GEODATA_FIELDS = {"geosite.dat": "Geositeurl", "geoip.dat": "Geoipurl"}
 
 HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
 }
 BODY_VALIDATORS = {"etag", "content-md5", "content-digest", "digest", "accept-ranges"}
+
+
+def geodata_version(directory):
+    if directory is not None:
+        try:
+            return int((directory / "current").read_text(encoding="ascii"))
+        except (OSError, ValueError):
+            pass
+    return 0
+
+
+def refresh_routing(value, directory, geodata_url):
+    prefix = "happ://routing/"
+    if not value.startswith(prefix):
+        return value
+    action, _, payload = value.removeprefix(prefix).partition("/")
+    if action not in {"add", "onadd"}:
+        return value
+    try:
+        decoded = base64.b64decode(payload + "=" * (-len(payload) % 4), altchars=b"-_", validate=True)
+        profile = json.loads(decoded)
+    except ValueError:
+        return value
+    if not isinstance(profile, dict) or any(
+        profile.get(field) != geodata_url + name for name, field in GEODATA_FIELDS.items()
+    ):
+        return value
+
+    previous = profile.get("LastUpdated")
+    try:
+        previous_time = int(previous)
+    except (TypeError, ValueError):
+        previous_time = 0
+    version = geodata_version(directory)
+    if previous_time >= 10 ** 12:
+        version *= 1000
+    if version <= previous_time:
+        return value
+    profile["LastUpdated"] = version if type(previous) is int else str(version)
+    encoded = base64.b64encode(json.dumps(profile, ensure_ascii=False, separators=(",", ":")).encode()).decode()
+    return f"{prefix}{action}/{encoded}"
 
 
 def matches_profile(profile, hostname, profile_prefix):
@@ -74,9 +120,34 @@ class SubscriptionHandler(BaseHTTPRequestHandler):
         # Request URLs contain personal subscription IDs.
         pass
 
+    def send_geodata(self, name):
+        directory = self.server.geodata_dir
+        version = geodata_version(directory)
+        if name not in GEODATA_FIELDS or version <= 0:
+            self.send_error(404)
+            return
+        try:
+            source = (directory / str(version) / name).open("rb")
+        except FileNotFoundError:
+            self.send_error(404)
+            return
+        with source:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(os.fstat(source.fileno()).st_size))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if self.command == "GET":
+                shutil.copyfileobj(source, self.wfile)
+
     def forward(self):
         if not self.path.startswith("/") or self.path.startswith("//"):
             self.send_error(400)
+            return
+
+        path = self.path.partition("?")[0]
+        if self.server.geodata_dir is not None and path.startswith("/geo/"):
+            self.send_geodata(path.removeprefix("/geo/"))
             return
 
         headers = {
@@ -128,6 +199,8 @@ class SubscriptionHandler(BaseHTTPRequestHandler):
                 continue
             if updated != body and key.lower() in BODY_VALIDATORS:
                 continue
+            if status == 200 and key.lower() == "routing" and self.server.geodata_dir is not None:
+                value = refresh_routing(value, self.server.geodata_dir, self.server.geodata_url)
             self.send_header(key, value)
         if not no_body:
             self.send_header("Content-Length", str(len(updated)))
@@ -140,13 +213,16 @@ class SubscriptionHandler(BaseHTTPRequestHandler):
 
 
 class SubscriptionServer(ThreadingHTTPServer):
-    def __init__(self, address, origin_port, hostname, profile_prefix, *, origin_tls=None, public_tls=None):
+    def __init__(self, address, origin_port, hostname, profile_prefix, *, origin_tls=None, public_tls=None, geodata_dir=None):
         super().__init__(address, SubscriptionHandler)
         self.origin_port = origin_port
         self.hostname = hostname
         self.profile_prefix = profile_prefix
         self.origin_tls = origin_tls
         self.public_tls = public_tls
+        self.geodata_dir = geodata_dir
+        scheme = "https" if public_tls else "http"
+        self.geodata_url = f"{scheme}://{hostname}:{self.server_port}/geo/"
         self.connections = threading.BoundedSemaphore(MAX_CONNECTIONS)
 
     def process_request(self, request, client_address):
@@ -182,6 +258,7 @@ def main():
     parser.add_argument("--origin-port", type=int, default=2096)
     parser.add_argument("--hostname", required=True, help="DNS name on the 3x-ui certificate and VLESS profile")
     parser.add_argument("--profile-prefix", required=True, help="Start of the selected profile name")
+    parser.add_argument("--geodata-dir", type=Path, help="Directory of published GeoIP and GeoSite files")
     parser.add_argument("--cert")
     parser.add_argument("--key")
     args = parser.parse_args()
@@ -199,7 +276,7 @@ def main():
         public_tls.load_cert_chain(args.cert, args.key)
     with SubscriptionServer(
         (args.listen, args.port), args.origin_port, args.hostname, args.profile_prefix,
-        origin_tls=ssl.create_default_context(), public_tls=public_tls,
+        origin_tls=ssl.create_default_context(), public_tls=public_tls, geodata_dir=args.geodata_dir,
     ) as server:
         server.serve_forever()
 

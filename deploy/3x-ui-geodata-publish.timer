@@ -1,0 +1,10 @@
+[Unit]
+Description=Publish 3x-ui geo databases every Saturday
+
+[Timer]
+OnCalendar=Sat *-*-* 05:00:00 Europe/Moscow
+AccuracySec=1s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
