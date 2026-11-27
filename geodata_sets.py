@@ -108,11 +108,14 @@ def publish_set(sets, source, categories):
                     raise ValueError("Truncated geodata source")
                 frames.append(frame)
         data = b"".join(frames)
-        if len(data) < 1024:
+        if len(data) <= 1024:
             length, start = varint(data, 1)
             end = start + length
             # Pad inside the first entry using an unknown protobuf field.
-            padding = length_delimited(0x7A, bytes(1100 - len(data) - 2))
+            padding_size = max(0, 1023 - len(data))
+            if length < 128 and padding_size >= 128:
+                padding_size -= 1  # The entry's length prefix also grows.
+            padding = length_delimited(0x7A, bytes(padding_size))
             data = length_delimited(0x0A, data[start:end] + padding) + data[end:]
         parts[name] = data
         digest.update(len(data).to_bytes(8, "big"))

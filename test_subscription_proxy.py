@@ -8,7 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.parse import urlsplit
 
-from geodata_sets import varint
+from geodata_sets import length_delimited, varint
 from subscription_proxy import SubscriptionServer, rewrite_profile
 
 
@@ -167,9 +167,13 @@ class SubscriptionProxyTest(unittest.TestCase):
             sets.mkdir()
 
             def entry(tag):
-                code = tag.encode()
-                body = bytes([10, len(code)]) + code
-                return bytes([10, len(body)]) + body
+                body = length_delimited(0x0A, tag.encode())
+                if tag == "TELEGRAM":
+                    # Leave six bytes for both protobuf headers.
+                    body += length_delimited(0x7A, bytes(1024 - 6 - len(body)))
+                return length_delimited(0x0A, body)
+
+            self.assertEqual(len(entry("TELEGRAM")), 1024)
 
             (version / "geosite.dat").write_bytes(entry("CANVA") + entry("YOUTUBE"))
             (version / "geoip.dat").write_bytes(entry("TELEGRAM") + entry("RU"))
@@ -196,8 +200,8 @@ class SubscriptionProxyTest(unittest.TestCase):
                 status, headers, data = request(url)
                 self.assertEqual(status, 200)
                 self.assertEqual(int(headers["Content-Length"]), len(data))
-                self.assertGreaterEqual(len(data), 1100)
-                self.assertLessEqual(len(data), 1102)
+                self.assertGreaterEqual(len(data), 1025)
+                self.assertLessEqual(len(data), 1026)
                 length, start = varint(data, 1)
                 self.assertEqual(start + length, len(data))
                 _, original_start = varint(entry(tag), 1)
