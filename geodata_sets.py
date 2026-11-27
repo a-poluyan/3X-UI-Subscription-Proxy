@@ -57,6 +57,16 @@ def varint(data, offset):
     raise ValueError("Invalid geodata varint")
 
 
+def length_delimited(tag, data):
+    length = len(data)
+    prefix = bytearray([tag])
+    while length >= 128:
+        prefix.append((length & 127) | 128)
+        length >>= 7
+    prefix.append(length)
+    return bytes(prefix) + data
+
+
 @lru_cache(maxsize=4)
 def section_index(path):
     # Both Xray lists encode each section as field 1, with the section code in its field 1.
@@ -97,7 +107,14 @@ def publish_set(sets, source, categories):
                 if len(frame) != length:
                     raise ValueError("Truncated geodata source")
                 frames.append(frame)
-        data = parts[name] = b"".join(frames)
+        data = b"".join(frames)
+        if len(data) < 1024:
+            length, start = varint(data, 1)
+            end = start + length
+            # Pad inside the first entry using an unknown protobuf field.
+            padding = length_delimited(0x7A, bytes(1100 - len(data) - 2))
+            data = length_delimited(0x0A, data[start:end] + padding) + data[end:]
+        parts[name] = data
         digest.update(len(data).to_bytes(8, "big"))
         digest.update(data)
 

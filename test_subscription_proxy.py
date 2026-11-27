@@ -8,6 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.parse import urlsplit
 
+from geodata_sets import varint
 from subscription_proxy import SubscriptionServer, rewrite_profile
 
 
@@ -190,8 +191,18 @@ class SubscriptionProxyTest(unittest.TestCase):
             ip_path = urlsplit(first["Geoipurl"]).path + "?" + urlsplit(first["Geoipurl"]).query
             self.assertIn("?set=", site_path)
             self.assertEqual(site_path.split("?")[1], ip_path.split("?")[1])
-            self.assertEqual(request(site_path)[2], entry("CANVA"))
-            self.assertEqual(request(ip_path)[2], entry("TELEGRAM"))
+            compact_files = {}
+            for url, tag in ((site_path, "CANVA"), (ip_path, "TELEGRAM")):
+                status, headers, data = request(url)
+                self.assertEqual(status, 200)
+                self.assertEqual(int(headers["Content-Length"]), len(data))
+                self.assertGreaterEqual(len(data), 1100)
+                self.assertLessEqual(len(data), 1102)
+                length, start = varint(data, 1)
+                self.assertEqual(start + length, len(data))
+                _, original_start = varint(entry(tag), 1)
+                self.assertTrue(data[start:].startswith(entry(tag)[original_start:]))
+                compact_files[url] = data
             self.assertIn("immutable", request(site_path, "HEAD")[1]["Cache-Control"])
             self.assertEqual(request("/geo/geosite.dat")[2], entry("CANVA") + entry("YOUTUBE"))
             self.assertEqual(request("/geo/geosite.dat?set=../current")[0], 404)
@@ -216,8 +227,8 @@ class SubscriptionProxyTest(unittest.TestCase):
                 ("127.0.0.1", 0), origin.server_port, HOSTNAME, PREFIX, geodata_dir=path,
             ))
             proxy = restarted
-            self.assertEqual(request(site_path)[2], entry("CANVA"))
-            self.assertEqual(request(ip_path)[2], entry("TELEGRAM"))
+            for url, data in compact_files.items():
+                self.assertEqual(request(url)[2], data)
 
 
 
